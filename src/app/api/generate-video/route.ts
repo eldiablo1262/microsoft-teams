@@ -66,7 +66,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const body = await request.json()
-    const { text, voiceId, photoBase64: rawB64, photoPath, prompt, filename, silent, audioPath } = body
+    const { text, voiceId, photoBase64: rawB64, photoPath, prompt, filename, silent, audioPath, audioBase64: rawAudioB64 } = body
 
     // Support either direct base64 or a file path (uploaded via /api/upload-photo)
     let photoBase64 = rawB64
@@ -85,15 +85,22 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Missing photo (photoBase64 or photoPath)' }, { status: 400 })
     }
 
+    // Pre-resolved audio base64 (sent directly from frontend — survives Railway redeploys)
+    let preResolvedAudioB64 = rawAudioB64 || null
+
     const videoPrompt = prompt || 'Continuous uninterrupted webcam shot, head and shoulders framing, fixed camera with no movement. A person is in a live professional video conference call. CRITICAL RULE: The person MUST keep their mouth COMPLETELY CLOSED and STILL during ALL silent/quiet sections of the audio. Absolutely ZERO lip movement, ZERO jaw movement, ZERO mouth opening when there is no speech audio. The lips must remain pressed together naturally as if the person is simply listening. During these silent periods, the person shows ONLY subtle idle body language: very gentle weight shifts, slow natural head tilts, occasional eyebrow raises, relaxed blinking at varied intervals, subtle chest breathing motion, slight nods as if listening, and minor postural adjustments. All these idle movements flow smoothly so the video never loops. When speech audio begins, the person speaks with precise natural lip sync matching the audio exactly, with natural conversational head motion. Transitions from listening (mouth closed) to speaking (lip sync) must be smooth. The mouth opens ONLY when audio speech is present. Photorealistic webcam quality, soft natural office lighting, shallow depth of field on the background.'
 
-    // Step 1: Generate audio — pre-built file, silent mode, or ElevenLabs TTS
+    // Step 1: Generate audio — pre-resolved base64, pre-built file, silent mode, or ElevenLabs TTS
     let audioB64: string
-    if (audioPath) {
-      // Pre-built audio file (from /api/combine-audio)
+    if (preResolvedAudioB64) {
+      // Audio sent directly as base64 from frontend (survives Railway redeploys)
+      audioB64 = preResolvedAudioB64
+      console.log(`[GEN] Step 1: Audio from base64 (${(audioB64.length / 1024).toFixed(0)} KB)`)
+    } else if (audioPath) {
+      // Pre-built audio file (from /api/combine-audio) — fallback if base64 not provided
       const absAudioPath = path.join(process.cwd(), 'public', audioPath)
       if (!fs.existsSync(absAudioPath)) {
-        return NextResponse.json({ error: `Audio file not found: ${audioPath}` }, { status: 400 })
+        return NextResponse.json({ error: `WAV file not found: ${audioPath}. Use audioBase64 instead.` }, { status: 400 })
       }
       const audioBuf = fs.readFileSync(absAudioPath)
       audioB64 = `data:audio/wav;base64,${audioBuf.toString('base64')}`

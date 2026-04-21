@@ -51,6 +51,7 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({
         status: 'succeeded',
         videoUrl: `/videos-generated/${fname}`,
+        replicateUrl: outputUrl,
         size: videoBuffer.length,
       })
     }

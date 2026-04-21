@@ -22,15 +22,15 @@ function getFfmpegPath(): string {
 }
 
 // Concatenate multiple MP4 video files into one using ffmpeg
+// Supports remote URLs as fallback if local files were deleted (Railway redeploy)
 export async function POST(request: NextRequest) {
   try {
-    const { videoPaths, outputFilename } = await request.json()
+    const { videoPaths, remoteUrls, outputFilename } = await request.json()
     if (!videoPaths || videoPaths.length === 0) {
       return NextResponse.json({ error: 'Missing videoPaths' }, { status: 400 })
     }
 
     if (videoPaths.length === 1) {
-      // No concatenation needed
       return NextResponse.json({ success: true, videoUrl: videoPaths[0] })
     }
 
@@ -38,6 +38,33 @@ export async function POST(request: NextRequest) {
     const publicDir = path.join(process.cwd(), 'public')
     const outDir = path.join(publicDir, 'videos-generated')
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true })
+
+    // Ensure all chunk files exist locally — download from remote URLs if missing
+    for (let i = 0; i < videoPaths.length; i++) {
+      const localPath = path.join(publicDir, videoPaths[i])
+      if (!fs.existsSync(localPath)) {
+        const remoteUrl = remoteUrls?.[i]
+        if (remoteUrl) {
+          console.log(`[CONCAT] Chunk ${i} missing locally, downloading from Replicate...`)
+          try {
+            const res = await fetch(remoteUrl)
+            if (res.ok) {
+              const buf = Buffer.from(await res.arrayBuffer())
+              const dir = path.dirname(localPath)
+              if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+              fs.writeFileSync(localPath, buf)
+              console.log(`[CONCAT] Downloaded chunk ${i}: ${(buf.length / 1024 / 1024).toFixed(1)} MB`)
+            } else {
+              console.error(`[CONCAT] Failed to download chunk ${i}: HTTP ${res.status}`)
+            }
+          } catch (dlErr: any) {
+            console.error(`[CONCAT] Failed to download chunk ${i}:`, dlErr.message)
+          }
+        } else {
+          console.error(`[CONCAT] Chunk ${i} missing and no remote URL available: ${videoPaths[i]}`)
+        }
+      }
+    }
 
     // Create concat list file for ffmpeg
     const listFilePath = path.join(outDir, `concat-list-${Date.now()}.txt`)
@@ -48,7 +75,6 @@ export async function POST(request: NextRequest) {
     fs.writeFileSync(listFilePath, listContent)
 
     console.log(`[CONCAT] Concatenating ${videoPaths.length} videos...`)
-    console.log(`[CONCAT] List file: ${listFilePath}`)
 
     const fname = outputFilename || `concat-${Date.now()}.mp4`
     const outputPath = path.join(outDir, fname)
@@ -58,13 +84,13 @@ export async function POST(request: NextRequest) {
       '-f', 'concat',
       '-safe', '0',
       '-i', listFilePath,
-      '-c', 'copy',  // no re-encoding, just copy streams
-      '-y',          // overwrite output
+      '-c', 'copy',
+      '-y',
       outputPath,
-    ], { timeout: 120000 }) // 2 min timeout
+    ], { timeout: 120000 })
 
     // Cleanup list file
-    fs.unlinkSync(listFilePath)
+    try { fs.unlinkSync(listFilePath) } catch {}
 
     const stats = fs.statSync(outputPath)
     console.log(`[CONCAT] Done: ${fname} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)

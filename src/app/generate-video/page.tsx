@@ -132,7 +132,7 @@ export default function ScenarioBuilder() {
     predictionId: string,
     filename: string,
     onProgress?: (msg: string) => void
-  ): Promise<{ status: string; videoUrl?: string; error?: string }> => {
+  ): Promise<{ status: string; videoUrl?: string; replicateUrl?: string; error?: string }> => {
     // Track this prediction
     setActivePredictions(prev => [...prev, predictionId])
     const MAX_POLLS = 720 // 720 × 5s = 1h max
@@ -150,7 +150,7 @@ export default function ScenarioBuilder() {
           const res = await fetch(`/api/check-prediction?id=${predictionId}&filename=${encodeURIComponent(filename)}`)
           const data = await res.json()
           if (data.status === 'succeeded') {
-            return { status: 'succeeded', videoUrl: data.videoUrl }
+            return { status: 'succeeded', videoUrl: data.videoUrl, replicateUrl: data.replicateUrl }
           }
           if (data.status === 'failed') {
             return { status: 'failed', error: data.error }
@@ -325,17 +325,18 @@ export default function ScenarioBuilder() {
         const c = cases.find(cc => cc.id === pid)!
         currentStep++
         const audioTrack = combData.audioTracks[pid]
+        const audioB64 = combData.audioBase64?.[pid] || null
 
         // Check if we need to split into chunks
         if (totalMeetingDuration > MAX_CHUNK_SEC) {
           addLog(`[VIDEO] ${c.label}: duree ${totalMeetingDuration.toFixed(0)}s > ${MAX_CHUNK_SEC}s, decoupage en chunks...`)
           setGenStatus({ phase: 'video', current: currentStep, total: totalSteps, detail: `Phase 3: Decoupage audio ${c.label}...`, log })
 
-          // Split audio into chunks
+          // Split audio into chunks — pass base64 to survive Railway redeploys
           const splitRes = await fetch('/api/split-audio', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ wavPath: audioTrack, maxChunkSeconds: MAX_CHUNK_SEC }),
+            body: JSON.stringify({ wavPath: audioTrack, wavBase64: audioB64, maxChunkSeconds: MAX_CHUNK_SEC }),
           })
           const splitData = await splitRes.json()
           if (!splitData.success) {
@@ -343,11 +344,12 @@ export default function ScenarioBuilder() {
             continue
           }
 
-          const chunks = splitData.chunks as { wavPath: string; duration: number }[]
+          const chunks = splitData.chunks as { wavPath: string; duration: number; audioBase64?: string }[]
           addLog(`[VIDEO] ${c.label}: ${chunks.length} chunks a generer`)
 
           // Generate video for each chunk sequentially
           const chunkVideoPaths: string[] = []
+          const chunkRemoteUrls: string[] = []
           let allChunksOk = true
 
           for (let ci = 0; ci < chunks.length; ci++) {
@@ -367,11 +369,12 @@ export default function ScenarioBuilder() {
                 }
 
                 const chunkFilename = `chunk-${pid}-${ci}-${Date.now()}.mp4`
-                // Step A: Create prediction (fast, returns immediately)
+                // Step A: Create prediction — pass audioBase64 directly (survives Railway redeploys)
                 const vRes = await fetch('/api/generate-video', {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({
+                    audioBase64: chunk.audioBase64,
                     audioPath: chunk.wavPath,
                     photoBase64: c.photoBase64,
                     prompt: VIDEO_PROMPT,
@@ -382,9 +385,8 @@ export default function ScenarioBuilder() {
                 if (!vData.success || !vData.predictionId) {
                   const errMsg = vData.error || 'unknown'
                   addLog(`[VIDEO] ${c.label}: chunk ${ci + 1} ERREUR creation - ${errMsg}`)
-                  // Retry on transient errors (E004, 503, temporarily unavailable)
                   if (errMsg.includes('temporarily') || errMsg.includes('503') || errMsg.includes('E004')) {
-                    continue // retry
+                    continue
                   }
                   allChunksOk = false
                   break
@@ -397,14 +399,14 @@ export default function ScenarioBuilder() {
                 })
                 if (pollResult.status === 'succeeded' && pollResult.videoUrl) {
                   chunkVideoPaths.push(pollResult.videoUrl)
+                  chunkRemoteUrls.push(pollResult.replicateUrl || '')
                   addLog(`[VIDEO] ${c.label}: chunk ${ci + 1} OK`)
                   chunkSuccess = true
                 } else {
                   const errMsg = pollResult.error || 'echec'
                   addLog(`[VIDEO] ${c.label}: chunk ${ci + 1} ERREUR - ${errMsg}`)
-                  // Retry on transient errors
                   if (errMsg.includes('temporarily') || errMsg.includes('503') || errMsg.includes('E004')) {
-                    continue // retry
+                    continue
                   }
                   allChunksOk = false
                   break
@@ -437,6 +439,7 @@ export default function ScenarioBuilder() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                   videoPaths: chunkVideoPaths,
+                  remoteUrls: chunkRemoteUrls,
                   outputFilename: `meeting-${pid}-${Date.now()}.mp4`,
                 }),
               })
@@ -476,6 +479,7 @@ export default function ScenarioBuilder() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
+                  audioBase64: audioB64,
                   audioPath: audioTrack,
                   photoBase64: c.photoBase64,
                   prompt: VIDEO_PROMPT,

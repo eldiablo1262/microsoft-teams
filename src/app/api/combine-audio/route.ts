@@ -52,6 +52,7 @@ export async function POST(request: NextRequest) {
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true })
 
     const audioTracks: Record<string, string> = {}
+    const audioBase64Map: Record<string, string> = {}
 
     for (const pid of participantIds) {
       // Create a silent buffer for the full meeting duration
@@ -82,11 +83,29 @@ export async function POST(request: NextRequest) {
       const wavPath = path.join(outDir, fname)
       saveWav(track, wavPath)
 
+      // Build WAV buffer for base64 (same as file, but kept in memory)
+      const wavHeader = Buffer.alloc(44)
+      wavHeader.write('RIFF', 0)
+      wavHeader.writeUInt32LE(36 + track.length, 4)
+      wavHeader.write('WAVE', 8)
+      wavHeader.write('fmt ', 12)
+      wavHeader.writeUInt32LE(16, 16)
+      wavHeader.writeUInt16LE(1, 20)
+      wavHeader.writeUInt16LE(1, 22)
+      wavHeader.writeUInt32LE(PCM_RATE, 24)
+      wavHeader.writeUInt32LE(PCM_RATE * 2, 28)
+      wavHeader.writeUInt16LE(2, 32)
+      wavHeader.writeUInt16LE(16, 34)
+      wavHeader.write('data', 36)
+      wavHeader.writeUInt32LE(track.length, 40)
+      const wavBuf = Buffer.concat([wavHeader, track])
+
       audioTracks[pid] = `/audio-temp/${fname}`
-      console.log(`[COMBINE] Saved: ${fname}`)
+      audioBase64Map[pid] = `data:audio/wav;base64,${wavBuf.toString('base64')}`
+      console.log(`[COMBINE] Saved: ${fname} (base64: ${(wavBuf.length / 1024).toFixed(0)} KB)`)
     }
 
-    return NextResponse.json({ success: true, audioTracks })
+    return NextResponse.json({ success: true, audioTracks, audioBase64: audioBase64Map })
   } catch (err: any) {
     console.error('[COMBINE] Error:', err)
     return NextResponse.json({ error: err.message }, { status: 500 })

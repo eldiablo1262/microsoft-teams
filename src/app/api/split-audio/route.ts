@@ -30,25 +30,34 @@ function buildWavBuffer(pcmData: Buffer): Buffer {
 // Returns list of chunk WAV paths and their durations
 export async function POST(request: NextRequest) {
   try {
-    const { wavPath, maxChunkSeconds } = await request.json()
-    if (!wavPath) return NextResponse.json({ error: 'Missing wavPath' }, { status: 400 })
+    const { wavPath, wavBase64, maxChunkSeconds } = await request.json()
+    if (!wavPath && !wavBase64) return NextResponse.json({ error: 'Missing wavPath or wavBase64' }, { status: 400 })
 
     const maxSec = maxChunkSeconds || 25
-    const absPath = path.join(process.cwd(), 'public', wavPath)
-    if (!fs.existsSync(absPath)) {
-      return NextResponse.json({ error: `WAV file not found: ${wavPath}` }, { status: 400 })
-    }
 
-    const wavBuf = fs.readFileSync(absPath)
+    let wavBuf: Buffer
+    if (wavBase64) {
+      // Audio sent as base64 data URI (survives Railway redeploys)
+      const b64Data = wavBase64.includes(',') ? wavBase64.split(',')[1] : wavBase64
+      wavBuf = Buffer.from(b64Data, 'base64')
+      console.log(`[SPLIT] Audio from base64 (${(wavBuf.length / 1024).toFixed(0)} KB)`)
+    } else {
+      const absPath = path.join(process.cwd(), 'public', wavPath)
+      if (!fs.existsSync(absPath)) {
+        return NextResponse.json({ error: `WAV file not found: ${wavPath}` }, { status: 400 })
+      }
+      wavBuf = fs.readFileSync(absPath)
+    }
     // Skip 44-byte WAV header to get raw PCM
     const pcmData = wavBuf.subarray(44)
     const totalDuration = pcmData.length / (PCM_RATE * 2)
 
     if (totalDuration <= maxSec) {
-      // No splitting needed
+      // No splitting needed — return the full audio as base64 too
+      const fullB64 = `data:audio/wav;base64,${wavBuf.toString('base64')}`
       return NextResponse.json({
         success: true,
-        chunks: [{ wavPath, duration: totalDuration }],
+        chunks: [{ wavPath: wavPath || 'inline', duration: totalDuration, audioBase64: fullB64 }],
         totalDuration,
       })
     }
@@ -57,7 +66,7 @@ export async function POST(request: NextRequest) {
     const outDir = path.join(process.cwd(), 'public', 'audio-temp')
     if (!fs.existsSync(outDir)) fs.mkdirSync(outDir, { recursive: true })
 
-    const chunks: { wavPath: string; duration: number }[] = []
+    const chunks: { wavPath: string; duration: number; audioBase64: string }[] = []
     let offset = 0
     let chunkIndex = 0
 
@@ -66,18 +75,21 @@ export async function POST(request: NextRequest) {
       const chunkPcm = pcmData.subarray(offset, end)
       const chunkDuration = chunkPcm.length / (PCM_RATE * 2)
 
-      const fname = `chunk-${path.basename(wavPath, '.wav')}-${chunkIndex}-${Date.now()}.wav`
+      const baseName = wavPath ? path.basename(wavPath, '.wav') : 'inline'
+      const fname = `chunk-${baseName}-${chunkIndex}-${Date.now()}.wav`
       const chunkWav = buildWavBuffer(chunkPcm)
       fs.writeFileSync(path.join(outDir, fname), chunkWav)
 
-      chunks.push({ wavPath: `/audio-temp/${fname}`, duration: chunkDuration })
+      // Also return chunk as base64 (survives Railway redeploys)
+      const chunkB64 = `data:audio/wav;base64,${chunkWav.toString('base64')}`
+      chunks.push({ wavPath: `/audio-temp/${fname}`, duration: chunkDuration, audioBase64: chunkB64 })
       console.log(`[SPLIT] Chunk ${chunkIndex}: ${chunkDuration.toFixed(1)}s (${(chunkWav.length / 1024).toFixed(0)} KB)`)
 
       offset = end
       chunkIndex++
     }
 
-    console.log(`[SPLIT] ${wavPath} → ${chunks.length} chunks (total ${totalDuration.toFixed(1)}s, max ${maxSec}s each)`)
+    console.log(`[SPLIT] ${wavPath || 'inline'} → ${chunks.length} chunks (total ${totalDuration.toFixed(1)}s, max ${maxSec}s each)`)
 
     return NextResponse.json({ success: true, chunks, totalDuration })
   } catch (err: any) {
