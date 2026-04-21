@@ -54,6 +54,8 @@ function MeetingRoomInner() {
   const [speakingId, setSpeakingId] = useState<string | null>(null)
   const [scenarioStatus, setScenarioStatus] = useState('')
   const [meetingState, setMeetingState] = useState<MeetingState>({ started: false, startedAt: null, clientJoined: false, adminJoined: false })
+  const [displayName, setDisplayName] = useState(isAdmin ? 'Admin' : 'Client')
+  const prevClientJoinedRef = useRef(false)
 
   const audioElRef = useRef<HTMLAudioElement>(null)
   const liveVideoRef = useRef<HTMLVideoElement>(null)
@@ -229,12 +231,32 @@ function MeetingRoomInner() {
   }, [joined, meetingData])
 
   // Start all videos muted, ticker handles unmuting the active speaker
-  const startAllVideos = useCallback((syncToTime?: number) => {
+  const startAllVideos = useCallback(async (syncToTime?: number) => {
     if (!meetingData) return
     const startOffset = syncToTime || 0
     console.log(`[PLAY] Starting ${meetingData.participants.length} videos, sync=${startOffset.toFixed(1)}s`)
 
-    const playPromises: Promise<void>[] = []
+    // Wait for all videos to have enough data to play
+    const waitForReady = (vid: HTMLVideoElement): Promise<void> => {
+      return new Promise(resolve => {
+        if (vid.readyState >= 3) return resolve() // HAVE_FUTURE_DATA
+        const onReady = () => { vid.removeEventListener('canplay', onReady); resolve() }
+        vid.addEventListener('canplay', onReady)
+        vid.load() // force load
+        setTimeout(resolve, 5000) // timeout safety
+      })
+    }
+
+    // Wait for all videos to be ready
+    const readyPromises: Promise<void>[] = []
+    meetingData.participants.forEach(p => {
+      const vid = videoRefs.current[p.id]
+      if (vid) readyPromises.push(waitForReady(vid))
+    })
+    await Promise.all(readyPromises)
+    console.log(`[PLAY] All ${readyPromises.length} videos ready, starting playback...`)
+
+    // Set sync time and start all at once
     meetingData.participants.forEach(p => {
       const vid = videoRefs.current[p.id]
       if (!vid) return
@@ -242,14 +264,16 @@ function MeetingRoomInner() {
         const d = vid.duration
         vid.currentTime = (d && d > 0 && startOffset > d) ? startOffset % d : startOffset
       }
-      vid.muted = true
-      playPromises.push(vid.play().catch(() => {}))
+      vid.muted = true // start muted for autoplay policy
+      vid.play().then(() => {
+        console.log(`[PLAY] ${p.name}: playing (duration=${vid.duration.toFixed(1)}s)`)
+      }).catch(err => {
+        console.error(`[PLAY] ${p.name}: play failed:`, err.message)
+      })
     })
 
-    Promise.all(playPromises).then(() => {
-      playStartRef.current = Date.now() - (startOffset * 1000)
-      console.log('[PLAY] All started')
-    })
+    playStartRef.current = Date.now() - (startOffset * 1000)
+    console.log(`[PLAY] All started, playStartRef=${playStartRef.current}`)
   }, [meetingData])
 
   // Notify server of join/leave
@@ -344,6 +368,23 @@ function MeetingRoomInner() {
       return () => { cancelled = true; clearTimeout(t) }
     }
   }, [isAdmin, joined, meetingState.clientJoined, meetingState.startedAt, meetingData, startAllVideos])
+
+  // Admin: re-initialize WebRTC when client joins (RTC data gets cleared on join)
+  useEffect(() => {
+    if (!isAdmin || !joined || !localStream) return
+    const wasJoined = prevClientJoinedRef.current
+    prevClientJoinedRef.current = meetingState.clientJoined
+    // Client just joined → close old peer + re-init
+    if (meetingState.clientJoined && !wasJoined) {
+      console.log('[ADMIN-RTC] Client joined! Re-initializing WebRTC...')
+      if (peerRef.current) {
+        peerRef.current.close()
+        peerRef.current = null
+      }
+      setRemoteStream(null)
+      rtcInitRef.current = false // allow re-init
+    }
+  }, [isAdmin, joined, localStream, meetingState.clientJoined])
 
   // ==================== WebRTC: Admin <-> Client live communication ====================
 
@@ -565,6 +606,13 @@ function MeetingRoomInner() {
                 En cours depuis {Math.floor((Date.now() - meetingState.startedAt) / 1000)}s
               </p>
             )}
+            <input
+              type="text"
+              value={displayName}
+              onChange={e => setDisplayName(e.target.value)}
+              placeholder="Votre nom..."
+              className="w-full max-w-[240px] bg-[#1a1a2e] text-white text-center text-sm rounded-lg px-4 py-2.5 outline-none border border-green-500/30 focus:border-green-400 placeholder-gray-500"
+            />
             <button
               onClick={handleJoin}
               className="bg-green-600 hover:bg-green-700 text-white font-bold px-12 py-4 rounded-xl text-lg transition-all shadow-lg shadow-green-600/40 animate-pulse hover:animate-none"
@@ -621,6 +669,14 @@ function MeetingRoomInner() {
             {meetingData.participants.length} participant{meetingData.participants.length > 1 ? 's' : ''} IA
             {isAdmin ? ' — Vous etes l\'admin' : ' + vous'}
           </p>
+
+          <input
+            type="text"
+            value={displayName}
+            onChange={e => setDisplayName(e.target.value)}
+            placeholder="Votre nom..."
+            className="w-full max-w-[260px] bg-[#201f1f] text-white text-center text-sm rounded-lg px-4 py-2.5 outline-none border border-[#383838] focus:border-[#5b5fc7] placeholder-gray-500"
+          />
 
           <button
             onClick={handleJoin}
@@ -800,7 +856,7 @@ function MeetingRoomInner() {
                   <div className="absolute bottom-0 left-0 right-0 z-20">
                     <div className="flex items-center gap-1.5 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
                       <span className="text-[13px] text-white font-medium drop-shadow-sm">
-                        {isAdmin ? 'Client' : 'Vous'}
+                        {isAdmin ? 'Client' : `${displayName} (Vous)`}
                       </span>
                     </div>
                   </div>
@@ -829,7 +885,7 @@ function MeetingRoomInner() {
                   <div className="absolute bottom-0 left-0 right-0 z-20">
                     <div className="flex items-center gap-1.5 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
                       <Eye className="w-3 h-3 text-indigo-300" />
-                      <span className="text-[13px] text-indigo-200 font-medium drop-shadow-sm">Admin (Vous)</span>
+                      <span className="text-[13px] text-indigo-200 font-medium drop-shadow-sm">{displayName} (Vous)</span>
                     </div>
                   </div>
                 </div>
@@ -860,7 +916,7 @@ function MeetingRoomInner() {
                   <div className="absolute bottom-0 left-0 right-0 z-20">
                     <div className="flex items-center gap-1.5 bg-gradient-to-t from-black/60 to-transparent px-3 py-2">
                       <Eye className="w-3 h-3 text-indigo-300" />
-                      <span className="text-[13px] text-indigo-200 font-medium drop-shadow-sm">Admin</span>
+                      <span className="text-[13px] text-indigo-200 font-medium drop-shadow-sm">Interlocuteur</span>
                     </div>
                   </div>
                 </div>

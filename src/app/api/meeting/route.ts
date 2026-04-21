@@ -111,10 +111,9 @@ export async function PATCH(request: NextRequest) {
         meeting.state.started = true
         meeting.state.startedAt = Date.now()
       }
-      // Clear stale RTC and admin state from previous sessions
+      // Clear stale RTC data only (not admin state — admin may already be connected)
       meeting.rtc = {}
-      meeting.state.adminJoined = false
-      console.log(`[MEETING] ${id}: Client joined (RTC reset)`)
+      console.log(`[MEETING] ${id}: Client joined (RTC data cleared, adminJoined=${meeting.state.adminJoined})`)
       break
     case 'clientLeave':
       meeting.state.clientJoined = false
