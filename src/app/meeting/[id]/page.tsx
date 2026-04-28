@@ -208,15 +208,24 @@ function MeetingRoomInner() {
       }
 
       meetingData.participants.forEach(p => {
-        const vid = videoRefs.current[p.id]
-        if (!vid) return
-        const isSpeaker = (p.id === currentSpeaker)
-        // Use volume (not muted) — muted toggling is blocked by browsers without gesture
-        vid.volume = isSpeaker ? 1 : 0
-
-        // If video is paused or stalled, try to resume
-        if (vid.paused || vid.readyState < 2) {
-          vid.play().catch(() => {})
+        const isSpeakerRole = (p.role || 'speaker') === 'speaker'
+        if (isSpeakerRole) {
+          // Speaker: manage main video volume + keep it playing
+          const vid = videoRefs.current[p.id]
+          if (!vid) return
+          const isSpeaker = (p.id === currentSpeaker)
+          vid.volume = isSpeaker ? 1 : 0
+          if (vid.paused || vid.readyState < 2) {
+            vid.play().catch(() => {})
+          }
+        } else {
+          // Listener: keep idle video playing (always muted)
+          const idleVid = idleVideoRefs.current[p.id]
+          if (idleVid && (idleVid.paused || idleVid.readyState < 2)) {
+            idleVid.muted = true
+            idleVid.loop = true
+            idleVid.play().catch(() => {})
+          }
         }
       })
 
@@ -242,8 +251,8 @@ function MeetingRoomInner() {
       }
 
       if (activeSeg) {
-        const speaker = meetingData.participants.find(p => p.id === activeSeg.participantId)
-        setScenarioStatus(`${speaker?.name || ''} parle...`)
+        // No status text — in a real meeting there's no "X parle..." indicator
+        setScenarioStatus('')
       } else if (now > meetingData.totalDuration && !meetingEndedRef.current) {
         // Meeting scenario ended — crossfade to idle videos, enable mic for live discussion
         meetingEndedRef.current = true
@@ -292,8 +301,14 @@ function MeetingRoomInner() {
     setVideoLoading(loadingState)
 
     const startSingleVideo = async (p: MeetingParticipant, retryCount = 0): Promise<void> => {
-      const vid = videoRefs.current[p.id]
-      if (!vid) return
+      const isSpeakerRole = (p.role || 'speaker') === 'speaker'
+      // Speakers use main video, listeners use idle video
+      const vid = isSpeakerRole ? videoRefs.current[p.id] : idleVideoRefs.current[p.id]
+      if (!vid) {
+        console.warn(`[PLAY] ${p.name}: no video ref (role=${p.role})`)
+        setVideoLoading(prev => ({ ...prev, [p.id]: false }))
+        return
+      }
 
       // Videos are blob URLs (in memory) — should be ready almost instantly
       if (vid.readyState < 2) {
@@ -305,18 +320,25 @@ function MeetingRoomInner() {
         })
       }
 
-      // Sync to correct time position
-      if (startOffset > 0 && vid.duration > 0) {
+      // Sync to correct time position (speakers only)
+      if (isSpeakerRole && startOffset > 0 && vid.duration > 0) {
         vid.currentTime = startOffset > vid.duration ? startOffset % vid.duration : startOffset
       }
 
-      // Use volume=0 (NOT muted) — muted toggling blocked by browsers without gesture
-      vid.muted = false
-      vid.volume = 0
+      // Listeners are always muted + looping
+      if (!isSpeakerRole) {
+        vid.muted = true
+        vid.volume = 0
+        vid.loop = true
+      } else {
+        // Use volume=0 (NOT muted) — muted toggling blocked by browsers without gesture
+        vid.muted = false
+        vid.volume = 0
+      }
 
       try {
         await vid.play()
-        console.log(`[PLAY] ${p.name}: playing from memory (d=${vid.duration.toFixed(1)}s)`)
+        console.log(`[PLAY] ${p.name}: playing from memory (role=${p.role}, d=${vid.duration.toFixed(1)}s)`)
         setVideoLoading(prev => ({ ...prev, [p.id]: false }))
       } catch (err: any) {
         console.warn(`[PLAY] ${p.name}: play failed (attempt ${retryCount}): ${err.message}`)
@@ -328,7 +350,7 @@ function MeetingRoomInner() {
               await vid.play()
               console.log(`[PLAY] ${p.name}: playing muted (fallback)`)
               setVideoLoading(prev => ({ ...prev, [p.id]: false }))
-              setAudioBlocked(true)
+              if (isSpeakerRole) setAudioBlocked(true)
               return
             } catch {}
           }
@@ -339,7 +361,7 @@ function MeetingRoomInner() {
       }
     }
 
-    // Start all in parallel — blob URLs = instant, no buffering
+    // Start ALL participants (speakers + listeners) in parallel
     await Promise.all(meetingData.participants.map(p => startSingleVideo(p)))
 
     playStartRef.current = Date.now() - (startOffset * 1000)
@@ -381,14 +403,18 @@ function MeetingRoomInner() {
     let cancelled = false
     let attempts = 0
     const speakers = meetingData.participants.filter(p => (p.role || 'speaker') === 'speaker')
+    const listeners = meetingData.participants.filter(p => p.role === 'listener')
 
     const tryStart = () => {
       if (cancelled) return
-      const refs = speakers.map(p => videoRefs.current[p.id]).filter(Boolean)
-      console.log(`[MEETING] tryStart attempt=${attempts}, refs=${refs.length}/${speakers.length}`)
+      // Check speakers have main video refs, listeners have idle video refs
+      const speakerRefs = speakers.map(p => videoRefs.current[p.id]).filter(Boolean)
+      const listenerRefs = listeners.map(p => idleVideoRefs.current[p.id]).filter(Boolean)
+      const ready = speakerRefs.length === speakers.length && listenerRefs.length === listeners.length
+      console.log(`[MEETING] tryStart attempt=${attempts}, speakers=${speakerRefs.length}/${speakers.length}, listeners=${listenerRefs.length}/${listeners.length}`)
 
-      if (refs.length === speakers.length) {
-        console.log(`[MEETING] All speaker refs ready — starting videos`)
+      if (ready) {
+        console.log(`[MEETING] All refs ready — starting videos`)
         startAllVideos()
       } else if (attempts < 100) {
         attempts++
@@ -453,29 +479,42 @@ function MeetingRoomInner() {
         return
       }
       meetingData.participants.forEach(p => {
-        const vid = videoRefs.current[p.id]
-        if (!vid) return
-        // Restart paused videos
-        if (vid.paused && vid.readyState >= 2) {
-          console.warn(`[WATCHDOG] ${p.name}: paused, restarting...`)
-          vid.play().catch(() => {})
-        }
-        // Reload errored videos — preserve currentTime for audio sync
-        if (vid.error) {
-          console.warn(`[WATCHDOG] ${p.name}: error ${vid.error.code}, reloading...`)
-          const savedTime = vid.currentTime
-          const src = vid.src
-          vid.src = ''
-          vid.src = src
-          vid.load()
-          setTimeout(() => {
-            if (savedTime > 0 && vid.duration > 0) vid.currentTime = Math.min(savedTime, vid.duration)
+        const isSpeakerRole = (p.role || 'speaker') === 'speaker'
+        // Speakers: watch main video. Listeners: watch idle video.
+        const vid = isSpeakerRole ? videoRefs.current[p.id] : null
+        const idleVid = idleVideoRefs.current[p.id]
+
+        // Keep main video playing (speakers)
+        if (vid) {
+          if (vid.paused && vid.readyState >= 2) {
+            console.warn(`[WATCHDOG] ${p.name}: main paused, restarting...`)
             vid.play().catch(() => {})
-          }, 2000)
+          }
+          if (vid.error) {
+            console.warn(`[WATCHDOG] ${p.name}: main error ${vid.error.code}, reloading...`)
+            const savedTime = vid.currentTime
+            const src = vid.src
+            vid.src = ''
+            vid.src = src
+            vid.load()
+            setTimeout(() => {
+              if (savedTime > 0 && vid.duration > 0) vid.currentTime = Math.min(savedTime, vid.duration)
+              vid.play().catch(() => {})
+            }, 2000)
+          }
+          if (vid.readyState < 2 && !vid.paused) {
+            console.warn(`[WATCHDOG] ${p.name}: main buffering (readyState=${vid.readyState})`)
+          }
         }
-        // Handle stalled (buffering)
-        if (vid.readyState < 2 && !vid.paused) {
-          console.warn(`[WATCHDOG] ${p.name}: buffering (readyState=${vid.readyState})`)
+
+        // Keep idle video playing (all participants — listeners always, speakers after scenario)
+        if (idleVid && idleVid.paused && idleVid.readyState >= 2) {
+          if (!isSpeakerRole || meetingEndedRef.current) {
+            idleVid.loop = true
+            idleVid.muted = true
+            idleVid.play().catch(() => {})
+            console.log(`[WATCHDOG] ${p.name}: idle restarted`)
+          }
         }
       })
     }, 3000)
@@ -648,21 +687,19 @@ function MeetingRoomInner() {
                 alignContent: 'center',
               }}
             >
-              {/* AI Participant tiles */}
+              {/* AI Participant tiles — ALL cameras always visible like a real meeting */}
               {meetingData.participants.map((p) => {
                 const isSpeakerRole = (p.role || 'speaker') === 'speaker'
                 const isSpeaking = !meetingEnded && speakingId === p.id && isSpeakerRole
-                const showMainVideo = isSpeaking
-                const showIdleVideo = !isSpeaking || meetingEnded
                 return (
                   <div
                     key={p.id}
-                    className={`relative rounded-lg overflow-hidden transition-all duration-200 ${
+                    className={`relative rounded-lg overflow-hidden transition-all duration-300 ${
                       isSpeaking ? 'ring-2 ring-green-500 z-10' : 'ring-1 ring-[#3b3b3b]'
                     }`}
                     style={{ backgroundColor: '#1a1a1a', aspectRatio: '16/9' }}
                   >
-                    {/* Main video (speakers only) — visible when speaking */}
+                    {/* Main video (speakers) — ALWAYS visible, plays continuously */}
                     {isSpeakerRole && (
                       <video
                         ref={el => { videoRefs.current[p.id] = el }}
@@ -671,26 +708,32 @@ function MeetingRoomInner() {
                         playsInline
                         loop={!meetingEnded}
                         crossOrigin="anonymous"
-                        className="absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ease-in-out"
-                        style={{ opacity: showMainVideo ? 1 : 0 }}
+                        className="absolute inset-0 w-full h-full object-cover"
+                        style={{ opacity: 1 }}
                       />
                     )}
-                    {/* Idle video — visible when NOT speaking or after scenario */}
-                    {idleBlobUrls[p.id] && (
+                    {/* Idle video — for listeners: always visible. For speakers: hidden behind main, shown after scenario ends */}
+                    {(idleBlobUrls[p.id] || (!isSpeakerRole && p.idleVideoUrl)) && (
                       <video
                         ref={el => { idleVideoRefs.current[p.id] = el }}
-                        src={idleBlobUrls[p.id]}
+                        src={idleBlobUrls[p.id] || p.idleVideoUrl}
                         preload="auto"
                         playsInline
                         muted
                         loop
                         crossOrigin="anonymous"
-                        className="absolute inset-0 w-full h-full object-cover transition-opacity duration-700 ease-in-out"
-                        style={{ opacity: showIdleVideo ? 1 : 0, pointerEvents: 'none' }}
+                        className="absolute inset-0 w-full h-full object-cover"
+                        style={{
+                          // Listeners: idle always on top. Speakers: idle on top only after scenario ends
+                          opacity: !isSpeakerRole ? 1 : (meetingEnded ? 1 : 0),
+                          zIndex: !isSpeakerRole ? 2 : (meetingEnded ? 2 : 0),
+                          transition: 'opacity 1s ease-in-out',
+                          pointerEvents: 'none',
+                        }}
                       />
                     )}
                     {/* Fallback for listeners with no idle video yet */}
-                    {!idleBlobUrls[p.id] && !isSpeakerRole && (
+                    {!idleBlobUrls[p.id] && !isSpeakerRole && !p.idleVideoUrl && (
                       <div className="absolute inset-0 flex items-center justify-center bg-[#1a1a1a]">
                         <div className="w-16 h-16 rounded-full flex items-center justify-center text-white text-xl font-bold" style={{ background: p.color }}>
                           {p.name.charAt(0)}
