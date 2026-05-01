@@ -54,7 +54,17 @@ export default function AdminMeetings() {
       const res = await fetch('/api/meeting?id=list')
       const data = await res.json()
       if (data.success) {
-        setMeetings(data.meetings)
+        setMeetings((prev: MeetingSummary[]) => {
+          const newMeetings = data.meetings as MeetingSummary[]
+          // Auto-select the newest active session if nothing is currently selected
+          const prevIds = new Set(prev.map((m: MeetingSummary) => m.id))
+          const brandNew = newMeetings.find((m: MeetingSummary) => !prevIds.has(m.id) && !m.isTemplate && m.state?.clientJoined)
+          if (brandNew) {
+            setSelectedMeeting(brandNew.id)
+            addLog(`New session: ${brandNew.clientName || brandNew.id}`)
+          }
+          return newMeetings
+        })
       }
     } catch {
       addLog('Erreur chargement reunions')
@@ -64,9 +74,9 @@ export default function AdminMeetings() {
 
   useEffect(() => { fetchMeetings() }, [fetchMeetings, refreshKey])
 
-  // Auto-refresh every 5s
+  // Auto-refresh every 2s — sessions appear almost instantly when a client joins
   useEffect(() => {
-    const t = setInterval(() => setRefreshKey(k => k + 1), 5000)
+    const t = setInterval(() => setRefreshKey(k => k + 1), 2000)
     return () => clearInterval(t)
   }, [])
 
