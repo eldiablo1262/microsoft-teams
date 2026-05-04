@@ -255,18 +255,15 @@ function MeetingRoomInner() {
   }, [joined])
 
   // Timeline ticker — controls which participant's audio is heard
-  // All videos play simultaneously, volume controls who is heard
-  // Drift correction strategy:
-  //   - Active speaker (volume=1): NEVER hard-seek (causes audio glitch "chchch")
-  //     Instead, nudge playbackRate to gently catch up/slow down
-  //   - Muted participants (volume=0): free to hard-seek (no audio = no glitch)
-  //   - Check drift every ~1s, not every tick
+  // ZERO INTERFERENCE on active speaker: no seeks, no playbackRate changes while speaking
+  // Sync happens ONLY at speaker transitions (while new speaker is still muted)
+  // Muted participants get hard-seeked freely (no audio = no artifact)
   useEffect(() => {
     if (!joined || !meetingData) return
 
     let lastSpeaker: string | null = null
     let logCounter = 0
-    let driftCounter = 0
+    let syncCounter = 0
 
     const tick = () => {
       if (playStartRef.current === 0) return
@@ -274,24 +271,43 @@ function MeetingRoomInner() {
       const activeSeg = meetingData.timeline.find(s => now >= s.startTime && now <= s.endTime)
       const currentSpeaker = activeSeg ? activeSeg.participantId : null
 
+      // Speaker transition — the ONLY moment we touch the active speaker's video
       if (currentSpeaker !== lastSpeaker) {
-        setSpeakingId(currentSpeaker)
-        const name = currentSpeaker ? meetingData.participants.find(p => p.id === currentSpeaker)?.name : 'nobody'
-        console.log(`[TICKER] t=${now.toFixed(1)}s → ${name}`)
+        // 1. Mute the OLD speaker first
+        if (lastSpeaker) {
+          const oldVid = videoRefs.current[lastSpeaker]
+          if (oldVid) oldVid.volume = 0
+        }
 
-        // When speaker changes, sync the NEW speaker immediately while still muted
-        // (the volume switch happens below, so the seek lands before audio starts)
+        // 2. Sync the NEW speaker while still at volume 0
         if (currentSpeaker) {
           const vid = videoRefs.current[currentSpeaker]
           if (vid && vid.duration > 0) {
             const expected = now <= vid.duration ? now : now % vid.duration
             const drift = Math.abs(vid.currentTime - expected)
-            if (drift > 0.08) {
+            if (drift > 0.05) {
               vid.currentTime = expected
-              vid.playbackRate = 1.0
             }
+            // Ensure playbackRate is normal
+            if (vid.playbackRate !== 1.0) vid.playbackRate = 1.0
+            // Ensure playing
+            if (vid.paused && vid.readyState >= 2) vid.play().catch(() => {})
           }
         }
+
+        // 3. Small delay to let the seek settle, then switch volume on
+        // (setTimeout ensures the browser has processed the seek before audio plays)
+        if (currentSpeaker) {
+          const speakerId = currentSpeaker
+          setTimeout(() => {
+            const vid = videoRefs.current[speakerId]
+            if (vid) vid.volume = 1
+          }, 30)
+        }
+
+        setSpeakingId(currentSpeaker)
+        const name = currentSpeaker ? meetingData.participants.find(p => p.id === currentSpeaker)?.name : 'silence'
+        console.log(`[TICKER] t=${now.toFixed(1)}s → ${name}`)
         lastSpeaker = currentSpeaker
       }
 
@@ -318,13 +334,8 @@ function MeetingRoomInner() {
         if (isSpeakerRole) {
           const vid = videoRefs.current[p.id]
           if (!vid) return
-          const isSpeaker = (p.id === currentSpeaker)
 
-          // Volume controls who is heard — instant switch
-          const targetVol = isSpeaker ? 1 : 0
-          if (vid.volume !== targetVol) vid.volume = targetVol
-
-          // Keep videos playing
+          // Keep all speaker videos playing (but DON'T touch volume here — handled by transition logic)
           if (vid.paused && vid.readyState >= 2) {
             vid.play().catch(() => {})
           }
@@ -339,41 +350,21 @@ function MeetingRoomInner() {
         }
       })
 
-      // Drift correction — every ~1s (every 10 ticks at 100ms)
-      driftCounter++
-      if (driftCounter % 10 === 0) {
+      // Sync MUTED participants only — every ~2s (every 20 ticks)
+      // Active speaker is NEVER touched during their turn
+      syncCounter++
+      if (syncCounter % 20 === 0) {
         meetingData.participants.forEach(p => {
           if ((p.role || 'speaker') !== 'speaker') return
           if (excludedIds.has(p.id)) return
+          if (p.id === currentSpeaker) return // NEVER touch the active speaker
           const vid = videoRefs.current[p.id]
           if (!vid || vid.paused || vid.duration === 0) return
 
           const expected = now <= vid.duration ? now : now % vid.duration
-          const drift = vid.currentTime - expected // positive = ahead, negative = behind
-
-          if (p.id === currentSpeaker) {
-            // ACTIVE SPEAKER: never hard-seek — use playbackRate to gently correct
-            const absDrift = Math.abs(drift)
-            if (absDrift > 1.0) {
-              // Extreme drift (>1s) — must hard-seek, brief audio blip is acceptable
-              vid.currentTime = expected
-              vid.playbackRate = 1.0
-              console.log(`[SYNC] ${p.name}: HARD seek (drift=${drift.toFixed(2)}s)`)
-            } else if (absDrift > 0.1) {
-              // Moderate drift — nudge playbackRate to catch up/slow down smoothly
-              vid.playbackRate = drift > 0 ? 0.97 : 1.03
-            } else {
-              // Good sync — normal speed
-              if (vid.playbackRate !== 1.0) vid.playbackRate = 1.0
-            }
-          } else {
-            // MUTED participant: hard-seek freely (no audio = no glitch)
-            if (Math.abs(drift) > 0.25) {
-              vid.currentTime = expected
-              vid.playbackRate = 1.0
-            } else if (vid.playbackRate !== 1.0) {
-              vid.playbackRate = 1.0
-            }
+          const drift = Math.abs(vid.currentTime - expected)
+          if (drift > 0.3) {
+            vid.currentTime = expected
           }
         })
       }
@@ -384,7 +375,7 @@ function MeetingRoomInner() {
         const states = meetingData.participants.map(p => {
           const v = videoRefs.current[p.id]
           if (!v) return `${p.name}:NO_REF`
-          return `${p.name}:${v.paused ? 'P' : 'OK'} t=${v.currentTime.toFixed(1)} r=${v.playbackRate} vol=${v.volume}`
+          return `${p.name}:${v.paused ? 'P' : 'OK'} t=${v.currentTime.toFixed(1)} vol=${v.volume}`
         }).join(' | ')
         console.log(`[STATE] t=${now.toFixed(1)}s spk=${currentSpeaker || '-'} | ${states}`)
       }
@@ -659,11 +650,16 @@ function MeetingRoomInner() {
         const idleVid = idleVideoRefs.current[p.id]
 
         // Keep main video playing (speakers)
+        // IMPORTANT: if this is the active speaker (volume > 0), do NOT seek — just restart playback
         if (vid) {
+          const isActiveSpeaker = vid.volume > 0
           if (vid.paused && vid.readyState >= 2) {
-            const wallClock = (Date.now() - playStartRef.current) / 1000
-            if (vid.duration > 0) vid.currentTime = wallClock <= vid.duration ? wallClock : wallClock % vid.duration
-            console.warn(`[WATCHDOG] ${p.name}: restarting at t=${vid.currentTime.toFixed(2)}s`)
+            // Only seek muted participants; active speaker just resumes from where it was
+            if (!isActiveSpeaker) {
+              const wallClock = (Date.now() - playStartRef.current) / 1000
+              if (vid.duration > 0) vid.currentTime = wallClock <= vid.duration ? wallClock : wallClock % vid.duration
+            }
+            console.warn(`[WATCHDOG] ${p.name}: restarting (active=${isActiveSpeaker})`)
             vid.play().catch(() => {})
           }
           if (vid.error) {
@@ -677,9 +673,6 @@ function MeetingRoomInner() {
               if (savedTime > 0 && vid.duration > 0) vid.currentTime = Math.min(savedTime, vid.duration)
               vid.play().catch(() => {})
             }, 2000)
-          }
-          if (vid.readyState < 2 && !vid.paused) {
-            console.warn(`[WATCHDOG] ${p.name}: main buffering (readyState=${vid.readyState})`)
           }
         }
 
