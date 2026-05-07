@@ -3,4 +3,4 @@
 aptPkgs = ["ffmpeg"]
 
 [start]
-cmd = "npx next start -H 0.0.0.0 -p ${PORT:-3000}"
+cmd = "node_modules/.bin/next start -H 0.0.0.0 -p $PORT"
