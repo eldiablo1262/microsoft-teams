@@ -2,8 +2,5 @@
 [phases.setup]
 aptPkgs = ["ffmpeg"]
 
-[phases.build]
-cmds = ["npm run build", "cp -r public .next/standalone/public", "cp -r .next/static .next/standalone/.next/static"]
-
 [start]
-cmd = "node .next/standalone/server.js"
+cmd = "npm run start"
