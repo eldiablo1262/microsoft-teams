@@ -2,8 +2,6 @@
 [phases.setup]
 aptPkgs = ["ffmpeg"]
 
-[variables]
-PORT = "3000"
 
 [start]
 cmd = "npm run start"
