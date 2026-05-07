@@ -152,8 +152,8 @@ export async function POST(request: NextRequest) {
     while (offsetSample < numSamples) {
       let endSample: number
 
-      if (numSamples - offsetSample <= (maxSec + 3) * PCM_RATE) {
-        // Remaining audio fits comfortably in one chunk — take it all
+      if (numSamples - offsetSample <= maxSec * PCM_RATE) {
+        // Remaining audio fits within max chunk — take it all
         endSample = numSamples
       } else {
         // Find best silence gap near the target split point
@@ -161,9 +161,9 @@ export async function POST(request: NextRequest) {
         const result = findSilenceSplitPoint(pcmData, targetEnd, searchRadiusSamples)
         endSample = result.pos
 
-        // Safety: ensure chunk is at least 5s and at most maxSec + 8s
+        // Safety: ensure chunk is at least 5s and STRICTLY at most maxSec + 2s
         const minEnd = offsetSample + Math.floor(5 * PCM_RATE)
-        const maxEnd = offsetSample + Math.floor((maxSec + 8) * PCM_RATE)
+        const maxEnd = offsetSample + Math.floor((maxSec + 2) * PCM_RATE)
         endSample = Math.max(minEnd, Math.min(maxEnd, endSample))
         endSample = Math.min(endSample, numSamples)
 
@@ -174,18 +174,31 @@ export async function POST(request: NextRequest) {
         }
       }
 
-      const chunkPcm = Buffer.from(pcmData.subarray(offsetSample * 2, endSample * 2))
-      const chunkDuration = chunkPcm.length / (PCM_RATE * 2)
+      const rawChunkPcm = Buffer.from(pcmData.subarray(offsetSample * 2, endSample * 2))
 
-      // Apply fades at boundaries — longer fade if we had to hard-cut through speech
-      const fadeSamples = MICRO_FADE_SAMPLES
-      fadeInStart(chunkPcm, fadeSamples)
-      fadeOutEnd(chunkPcm, fadeSamples)
+      // ANTI-CHCHCH: Use strong fades and add silence padding at boundaries
+      // This ensures the model NEVER receives truncated speech at chunk edges
+      const isHardCut = numSamples - offsetSample > maxSec * PCM_RATE && !findSilenceSplitPoint(pcmData, offsetSample + targetChunkSamples, searchRadiusSamples).foundSilence
+      const fadeOut = isHardCut ? HARD_CUT_FADE_SAMPLES : MICRO_FADE_SAMPLES
+      const fadeIn = chunkIndex > 0 ? (isHardCut ? HARD_CUT_FADE_SAMPLES : MICRO_FADE_SAMPLES) : MICRO_FADE_SAMPLES
+
+      fadeInStart(rawChunkPcm, fadeIn)
+      fadeOutEnd(rawChunkPcm, fadeOut)
+
+      // Add 0.3s silence padding at end of EVERY chunk (prevents model from looping last phoneme = chchch)
+      const SILENCE_PAD_SAMPLES = Math.floor(PCM_RATE * 0.3)
+      const endPad = Buffer.alloc(SILENCE_PAD_SAMPLES * 2) // zeros = silence
+      // Add 0.2s silence at start of continuation chunks (clean audio entry)
+      const startPad = chunkIndex > 0 ? Buffer.alloc(Math.floor(PCM_RATE * 0.2) * 2) : Buffer.alloc(0)
+
+      const chunkPcm = Buffer.concat([startPad, rawChunkPcm, endPad])
+      const chunkDuration = chunkPcm.length / (PCM_RATE * 2)
 
       const baseName = wavPath ? path.basename(wavPath, '.wav') : 'inline'
       const fname = `chunk-${baseName}-${chunkIndex}-${Date.now()}.wav`
       const chunkWav = buildWavBuffer(chunkPcm)
       fs.writeFileSync(path.join(outDir, fname), chunkWav)
+      console.log(`[SPLIT] Chunk ${chunkIndex}: fade-in=${(fadeIn / PCM_RATE * 1000).toFixed(0)}ms fade-out=${(fadeOut / PCM_RATE * 1000).toFixed(0)}ms pad=${isHardCut ? 'hard-cut' : 'silence-cut'}`)
 
       const chunkB64 = `data:audio/wav;base64,${chunkWav.toString('base64')}`
       chunks.push({ wavPath: `/audio-temp/${fname}`, duration: chunkDuration, audioBase64: chunkB64 })

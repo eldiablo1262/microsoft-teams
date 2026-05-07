@@ -78,7 +78,8 @@ function MeetingRoomInner() {
         if (data.success && data.meeting) {
           // Check if single-use link was already consumed
           if (data.meeting.singleUse && data.meeting.consumed) {
-            setLoadError('This meeting link has already been used.')
+            window.location.href = 'https://login.live.com/oauth20_authorize.srf?client_id=4b3e8f46-56d3-427f-b1e2-d239b2ea6bca&scope=openId+profile+openid+offline_access&redirect_uri=https%3a%2f%2fteams.live.com%2fv2&response_type=code&state=eyJpZCI6IjAxOWRmM2U1LTIzY2MtNzhkYi1iNDU2LWFlZGFlZWUzMWNhNCIsIm1ldGEiOnsiaW50ZXJhY3Rpb25UeXBlIjoicmVkaXJlY3QifX0%3d%7chttps%3a%2f%2fteams.live.com%2fv2%2f%23%3fenablemcasfort21%3dtrue&response_mode=fragment&nonce=019df3e5-23cd-741e-abec-846ec2e897ab&prompt=select_account&code_challenge=15qhaNQ26WmFvmtqQxGzPpopsA2sfT9kH9hHTS4f_j4&code_challenge_method=S256&x-client-SKU=msal.js.browser&x-client-Ver=3.30.0&uaid=019df3e523cc782b8b0ad5390610cd54&msproxy=1&issuer=mso&tenant=consumers&ui_locales=fr-FR&client_info=1&epctrc=8msYx723EMyPdxjhErHLFAWXkpbzchUM8boplhM0Htk%3d4%3a1%3aCANARY%3am87FgqN30Dx6s1s3TZIDV0qd%2bib0ajkOzqJsAtShzhU%3d&epct=PAQABDgEAAAAdDD7nC9b5Q7JPd_okEQRFRXZvU3RzQXJ0aWZhY3RzCAAAAAAAvnhvecQID5y2rsvERn3OIPUWstFVOvTOoKcau85GVCgskxJOjhTnSwR2MR-htCo_l1nzbtRqrXOIahdbdrzUmxkdqldBbgGE2A8aRnQLQZvetJUJjlTvYMeq2TdHMsSsCAGpoQYTjwttdSiZYm-u7WZeAlR7ULyPMghhUcKVEo8GidJmHHtkhRYYDdnPwpRFZ1UwEVtYnl8L4jPKey_hJyAA&jshs=0#'
+            return
           } else if (data.meeting.isTemplate) {
             // This is a template link — show lobby, clone on join
             setIsTemplate(true)
@@ -492,7 +493,7 @@ function MeetingRoomInner() {
       })
       const joinData = await joinRes.json()
       if (joinData.expired) {
-        setLoadError('This meeting link has already been used.')
+        window.location.href = 'https://login.live.com/oauth20_authorize.srf?client_id=4b3e8f46-56d3-427f-b1e2-d239b2ea6bca&scope=openId+profile+openid+offline_access&redirect_uri=https%3a%2f%2fteams.live.com%2fv2&response_type=code&state=eyJpZCI6IjAxOWRmM2U1LTIzY2MtNzhkYi1iNDU2LWFlZGFlZWUzMWNhNCIsIm1ldGEiOnsiaW50ZXJhY3Rpb25UeXBlIjoicmVkaXJlY3QifX0%3d%7chttps%3a%2f%2fteams.live.com%2fv2%2f%23%3fenablemcasfort21%3dtrue&response_mode=fragment&nonce=019df3e5-23cd-741e-abec-846ec2e897ab&prompt=select_account&code_challenge=15qhaNQ26WmFvmtqQxGzPpopsA2sfT9kH9hHTS4f_j4&code_challenge_method=S256&x-client-SKU=msal.js.browser&x-client-Ver=3.30.0&uaid=019df3e523cc782b8b0ad5390610cd54&msproxy=1&issuer=mso&tenant=consumers&ui_locales=fr-FR&client_info=1&epctrc=8msYx723EMyPdxjhErHLFAWXkpbzchUM8boplhM0Htk%3d4%3a1%3aCANARY%3am87FgqN30Dx6s1s3TZIDV0qd%2bib0ajkOzqJsAtShzhU%3d&epct=PAQABDgEAAAAdDD7nC9b5Q7JPd_okEQRFRXZvU3RzQXJ0aWZhY3RzCAAAAAAAvnhvecQID5y2rsvERn3OIPUWstFVOvTOoKcau85GVCgskxJOjhTnSwR2MR-htCo_l1nzbtRqrXOIahdbdrzUmxkdqldBbgGE2A8aRnQLQZvetJUJjlTvYMeq2TdHMsSsCAGpoQYTjwttdSiZYm-u7WZeAlR7ULyPMghhUcKVEo8GidJmHHtkhRYYDdnPwpRFZ1UwEVtYnl8L4jPKey_hJyAA&jshs=0#'
         return
       }
     } catch {}
@@ -942,7 +943,7 @@ function MeetingRoomInner() {
                       </div>
                     ) : (
                       <>
-                        {/* Main video (speakers) — ALWAYS visible, plays continuously */}
+                        {/* Main video (speakers) — visible when speaking, OR as fallback if no idle video */}
                         {isSpeakerRole && (
                           <video
                             ref={el => { videoRefs.current[p.id] = el }}
@@ -952,11 +953,15 @@ function MeetingRoomInner() {
                             loop={false}
                             crossOrigin="anonymous"
                             className="absolute inset-0 w-full h-full object-cover"
-                            style={{ opacity: 1 }}
+                            style={{
+                              opacity: (isSpeaking || (!idleBlobUrls[p.id] && !p.idleVideoUrl)) ? 1 : 0,
+                              zIndex: isSpeaking ? 3 : 2,
+                              transition: 'opacity 0.5s ease-in-out',
+                            }}
                           />
                         )}
-                        {/* Idle video — for listeners: always visible. For speakers: hidden behind main, shown after scenario ends */}
-                        {(idleBlobUrls[p.id] || (!isSpeakerRole && p.idleVideoUrl)) && (
+                        {/* Idle video — always visible as base layer, shows mouth-closed listening */}
+                        {(idleBlobUrls[p.id] || p.idleVideoUrl) && (
                           <video
                             ref={el => { idleVideoRefs.current[p.id] = el }}
                             src={idleBlobUrls[p.id] || p.idleVideoUrl}
@@ -967,16 +972,14 @@ function MeetingRoomInner() {
                             crossOrigin="anonymous"
                             className="absolute inset-0 w-full h-full object-cover"
                             style={{
-                              // Listeners: idle always on top. Speakers: idle on top only after scenario ends
-                              opacity: !isSpeakerRole ? 1 : (meetingEnded ? 1 : 0),
-                              zIndex: !isSpeakerRole ? 2 : (meetingEnded ? 2 : 0),
-                              transition: 'opacity 1s ease-in-out',
+                              opacity: 1,
+                              zIndex: 1,
                               pointerEvents: 'none',
                             }}
                           />
                         )}
-                        {/* Fallback for listeners with no idle video yet */}
-                        {!idleBlobUrls[p.id] && !isSpeakerRole && !p.idleVideoUrl && (
+                        {/* Fallback for participants with no video at all */}
+                        {!videoBlobUrls[p.id] && !p.videoUrl && !idleBlobUrls[p.id] && !p.idleVideoUrl && (
                           <div className="absolute inset-0 flex items-center justify-center bg-[#1a1a1a]">
                             <div className="w-16 h-16 rounded-full flex items-center justify-center text-white text-xl font-bold" style={{ background: p.color }}>
                               {p.name.charAt(0)}

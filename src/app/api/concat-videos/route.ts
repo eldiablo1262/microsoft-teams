@@ -131,10 +131,87 @@ export async function POST(request: NextRequest) {
       console.warn(`[CONCAT] Video copy + audio re-encode failed: ${copyErr.message?.slice(0, 150)}`)
     }
 
-    // Method 2: full re-encode (handles codec mismatches between chunks)
+    // Method 2: full re-encode with CROSSFADE (smooth transitions + no audio glitches)
     if (!ffmpegOk) {
       try {
-        // Use individual -i inputs instead of concat demuxer for better compatibility
+        const inputArgs: string[] = []
+        validPaths.forEach(vp => {
+          inputArgs.push('-i', path.join(publicDir, vp).replace(/\\/g, '/'))
+        })
+
+        const XFADE_DURATION = 0.4 // 400ms crossfade between chunks
+        let filterComplex = ''
+
+        if (validPaths.length === 2) {
+          // Simple 2-input xfade
+          filterComplex = `[0:v][1:v]xfade=transition=fade:duration=${XFADE_DURATION}:offset=OFFSET0[outv];[0:a][1:a]acrossfade=d=${XFADE_DURATION}:c1=tri:c2=tri[outa]`
+        } else {
+          // Chain xfade for 3+ inputs
+          // Build video chain
+          let vChain = '[0:v]'
+          for (let i = 1; i < validPaths.length; i++) {
+            const prevLabel = i === 1 ? '[0:v]' : `[xv${i - 1}]`
+            const outLabel = i === validPaths.length - 1 ? '[outv]' : `[xv${i}]`
+            filterComplex += `${prevLabel}[${i}:v]xfade=transition=fade:duration=${XFADE_DURATION}:offset=OFFSET${i - 1}${outLabel};`
+          }
+          // Build audio chain
+          let aChain = '[0:a]'
+          for (let i = 1; i < validPaths.length; i++) {
+            const prevLabel = i === 1 ? '[0:a]' : `[xa${i - 1}]`
+            const outLabel = i === validPaths.length - 1 ? '[outa]' : `[xa${i}]`
+            filterComplex += `${prevLabel}[${i}:a]acrossfade=d=${XFADE_DURATION}:c1=tri:c2=tri${outLabel};`
+          }
+          // Remove trailing semicolon
+          filterComplex = filterComplex.replace(/;$/, '')
+        }
+
+        // We need chunk durations to calculate xfade offsets
+        // Probe each file for duration
+        let offsets: number[] = []
+        let cumDuration = 0
+        for (let i = 0; i < validPaths.length - 1; i++) {
+          try {
+            const probePath = path.join(publicDir, validPaths[i]).replace(/\\/g, '/')
+            const { stdout } = await execFileAsync(ffmpegPath.replace('ffmpeg', 'ffprobe').replace('ffmpeg.exe', 'ffprobe.exe'), [
+              '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', probePath
+            ], { timeout: 10000 })
+            const dur = parseFloat(stdout.trim()) || 9
+            cumDuration += dur - (i > 0 ? XFADE_DURATION : 0)
+            offsets.push(cumDuration - XFADE_DURATION)
+          } catch {
+            cumDuration += 9 - (i > 0 ? XFADE_DURATION : 0)
+            offsets.push(cumDuration - XFADE_DURATION)
+          }
+        }
+
+        // Replace OFFSET placeholders with actual values
+        offsets.forEach((offset, i) => {
+          filterComplex = filterComplex.replace(`OFFSET${i}`, offset.toFixed(3))
+        })
+
+        console.log(`[CONCAT] Crossfade filter: ${filterComplex.slice(0, 300)}...`)
+
+        const { stderr } = await execFileAsync(ffmpegPath, [
+          ...inputArgs,
+          '-filter_complex', filterComplex,
+          '-map', '[outv]', '-map', '[outa]',
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
+          '-c:a', 'aac', '-b:a', '192k',
+          '-movflags', '+faststart', '-y', outputPath,
+        ], { timeout: 600000 })
+        
+        if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+          ffmpegOk = true
+          console.log('[CONCAT] Crossfade re-encode succeeded')
+        }
+      } catch (reencErr: any) {
+        console.error(`[CONCAT] Crossfade re-encode failed: ${reencErr.message?.slice(0, 200)}`)
+      }
+    }
+
+    // Method 2b: fallback without crossfade (simple concat with re-encode)
+    if (!ffmpegOk) {
+      try {
         const inputArgs: string[] = []
         validPaths.forEach(vp => {
           inputArgs.push('-i', path.join(publicDir, vp).replace(/\\/g, '/'))
@@ -152,10 +229,10 @@ export async function POST(request: NextRequest) {
         
         if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
           ffmpegOk = true
-          console.log('[CONCAT] Re-encode (filter_complex) succeeded')
+          console.log('[CONCAT] Simple re-encode (filter_complex) succeeded')
         }
       } catch (reencErr: any) {
-        console.error(`[CONCAT] Re-encode also failed: ${reencErr.message?.slice(0, 200)}`)
+        console.error(`[CONCAT] Simple re-encode also failed: ${reencErr.message?.slice(0, 200)}`)
       }
     }
 

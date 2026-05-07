@@ -86,6 +86,12 @@ export default function ScenarioBuilder() {
   const listenerFileRefs = useRef<Record<string, HTMLInputElement | null>>({})
   const [activePredictions, setActivePredictions] = useState<string[]>([])
   const cancelledRef = useRef(false)
+  const [historyList, setHistoryList] = useState<{ id: string; name: string; createdAt: number; casesCount: number; duration: number }[]>([])
+  const [showHistory, setShowHistory] = useState(false)
+  const [swapCaseId, setSwapCaseId] = useState<string | null>(null)
+  const [swapGenerating, setSwapGenerating] = useState(false)
+  const [wanModel, setWanModel] = useState<'wan-2.5' | 'wan-2.7' | 'wan-2.6' | 'wan-2.2'>('wan-2.5')
+  const [useLipsync, setUseLipsync] = useState(true) // Use WAN 2.7 + lipsync-2-pro pipeline (no cuts)
 
   // Load voices
   useEffect(() => {
@@ -96,6 +102,77 @@ export default function ScenarioBuilder() {
         setCases(prev => prev.map((c, i) => ({ ...c, voiceId: c.voiceId || keys[i] || keys[0] })))
       }
     })
+  }, [])
+
+  // Load history list
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await fetch('/api/meeting-history')
+      const data = await res.json()
+      if (data.success) setHistoryList(data.meetings || [])
+    } catch {}
+  }, [])
+
+  useEffect(() => { loadHistory() }, [loadHistory])
+
+  // Save current meeting to history
+  const saveToHistory = useCallback(async () => {
+    try {
+      await fetch('/api/meeting-history', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          cases: cases.map(c => ({ id: c.id, label: c.label, color: c.color, photoBase64: c.photoBase64, voiceId: c.voiceId, clonedVoiceId: c.clonedVoiceId })),
+          listeners: listeners.map(l => ({ id: l.id, label: l.label, color: l.color, photoBase64: l.photoBase64 })),
+          script: lines.map(l => ({ id: l.id, caseId: l.caseId, text: l.text, mode: l.mode })),
+          participantVideos,
+          participantIdleVideos,
+          timeline: meetingTimeline,
+          duration: meetingDuration,
+        }),
+      })
+      loadHistory()
+    } catch {}
+  }, [cases, listeners, lines, participantVideos, participantIdleVideos, meetingTimeline, meetingDuration, loadHistory])
+
+  // Load a meeting from history
+  const loadFromHistory = useCallback(async (meetingId: string) => {
+    try {
+      const res = await fetch(`/api/meeting-history/${meetingId}`)
+      const data = await res.json()
+      if (!data.success || !data.meeting) return
+      const m = data.meeting
+      // Restore cases with full config
+      if (m.cases) {
+        setCases(prev => m.cases.map((mc: any, i: number) => ({
+          ...prev[i] || { id: mc.id, voiceCloneStatus: 'none' as const, voiceCloneFileName: null, photo: null, photoPath: null },
+          id: mc.id, label: mc.label, color: mc.color, photoBase64: mc.photoBase64,
+          voiceId: mc.voiceId || '', clonedVoiceId: mc.clonedVoiceId || null,
+          photo: mc.photoBase64 ? 'loaded' : null, photoPath: mc.id,
+        })))
+      }
+      if (m.listeners) {
+        setListeners(m.listeners.map((ml: any) => ({
+          id: ml.id, label: ml.label, color: ml.color, photoBase64: ml.photoBase64,
+          photo: ml.photoBase64 ? 'loaded' : null, photoPath: ml.id,
+          idleVideoUrl: m.participantIdleVideos?.[ml.id] || '',
+        })))
+      }
+      if (m.script) {
+        setLines(m.script.map((ms: any) => ({
+          id: ms.id, caseId: ms.caseId, text: ms.text, mode: ms.mode || 'text',
+          audioFileName: null, audioPcmPath: null, audioDuration: null, audioUploading: false,
+        })))
+      }
+      if (m.participantVideos) setParticipantVideos(m.participantVideos)
+      if (m.participantIdleVideos) setParticipantIdleVideos(m.participantIdleVideos)
+      if (m.timeline) setMeetingTimeline(m.timeline)
+      if (m.duration) setMeetingDuration(m.duration)
+      if (m.participantVideos && Object.keys(m.participantVideos).length > 0) setScenarioReady(true)
+      setShowHistory(false)
+      setMeetingLinks([])
+      setLaunched(false)
+    } catch {}
   }, [])
 
   const handlePhoto = async (caseId: string, e: React.ChangeEvent<HTMLInputElement>) => {
@@ -262,18 +339,17 @@ export default function ScenarioBuilder() {
     setCases(prev => prev.map(cc => cc.id === caseId ? { ...cc, clonedVoiceId: null, voiceCloneStatus: 'none', voiceCloneFileName: null } : cc))
   }
 
-  // Helper: poll a Replicate prediction until done (each poll is fast — avoids Railway timeout)
+  // Helper: poll a prediction until done — supports both Replicate and AtlasCloud
   const pollPrediction = async (
     predictionId: string,
     filename: string,
     onProgress?: (msg: string) => void
   ): Promise<{ status: string; videoUrl?: string; replicateUrl?: string; error?: string }> => {
-    // Track this prediction
     setActivePredictions(prev => [...prev, predictionId])
     const MAX_POLLS = 720 // 720 × 5s = 1h max
+    const checkEndpoint = '/api/check-prediction'
     try {
       for (let i = 0; i < MAX_POLLS; i++) {
-        // Check if cancelled
         if (cancelledRef.current) {
           return { status: 'failed', error: 'Annulé par l\'utilisateur' }
         }
@@ -282,7 +358,7 @@ export default function ScenarioBuilder() {
           return { status: 'failed', error: 'Annulé par l\'utilisateur' }
         }
         try {
-          const res = await fetch(`/api/check-prediction?id=${predictionId}&filename=${encodeURIComponent(filename)}`)
+          const res = await fetch(`${checkEndpoint}?id=${predictionId}&filename=${encodeURIComponent(filename)}`)
           const data = await res.json()
           if (data.status === 'succeeded') {
             return { status: 'succeeded', videoUrl: data.videoUrl, replicateUrl: data.replicateUrl }
@@ -471,9 +547,9 @@ export default function ScenarioBuilder() {
       // PHASE 3+4: Generate speaking videos + idle videos IN PARALLEL
       // Idle videos don't depend on speaking results — start them immediately
       // ================================================
-      const MAX_CHUNK_SEC = 20
-      const BASE_VIDEO_PROMPT = 'A person in a professional video conference call, webcam framing head and shoulders, fixed camera. When audio plays, the person speaks with natural lip sync. When audio is silent, the person is actively listening: mouth fully closed, natural eye movements, subtle head tilts, slow blinks, gentle breathing, occasional nods. The person never stops moving naturally — continuous realistic human micro-movements throughout. Photorealistic quality, soft office lighting.'
-
+      const MAX_CHUNK_SEC = wanModel === 'wan-2.5' ? 9 : 14 // WAN 2.5 video max 10s, WAN 2.7 max 15s
+      const genEndpoint = '/api/generate-video'
+      const BASE_VIDEO_PROMPT = 'A person speaking in a video call. Natural lip sync with the audio. Webcam framing, fixed camera, photorealistic.'
       // Build per-participant prompt enriched with their [expressions]
       const buildParticipantPrompt = (pid: string): string => {
         const participantExpressions = ttsSegments
@@ -486,7 +562,8 @@ export default function ScenarioBuilder() {
 
       // --- LAUNCH IDLE GENERATION IN PARALLEL (non-blocking) ---
       const IDLE_PROMPT = 'A person in a professional video conference call, webcam framing head and shoulders, fixed camera. The person is actively listening to others speaking. Mouth fully closed at all times, no lip movement. Natural micro-movements: eye movements, subtle head tilts, slow blinks, gentle breathing, occasional nods. Continuous realistic human behavior throughout. Photorealistic quality, soft office lighting.'
-      const IDLE_DURATION = 30 // 30s — loops seamlessly in meeting page
+      const IDLE_DURATION = 30 // single idle clip
+      const IDLE_CLIPS = 1 // back to 1 clip for speed
       allIdleTargets = [
         ...usedCases.map(pid => {
           const c = cases.find(cc => cc.id === pid)!
@@ -497,30 +574,33 @@ export default function ScenarioBuilder() {
         })),
       ]
 
-      addLog(`[IDLE] Lancement parallele: ${allIdleTargets.length} videos d'ecoute (${IDLE_DURATION}s)...`)
+      addLog(`[IDLE] Lancement: ${allIdleTargets.length} personnes × ${IDLE_CLIPS} clips sequentiels (${IDLE_DURATION}s chacun)...`)
 
-      // Fire all idle generations in parallel — don't await yet
+      // Generate 1 idle clip per person — all in parallel for speed
       const idlePromises = allIdleTargets.map(async (target) => {
-        try {
-          for (let retry = 0; retry < 3; retry++) {
-            if (cancelledRef.current) return
-            if (retry > 0) await new Promise(r => setTimeout(r, retry * 10000))
+        if (cancelledRef.current) return
 
+        for (let retry = 0; retry < 3; retry++) {
+          if (cancelledRef.current) return
+          if (retry > 0) await new Promise(r => setTimeout(r, retry * 10000))
+
+          try {
             const idleFilename = `idle-${target.id}-${Date.now()}.mp4`
-            const vRes = await fetch('/api/generate-video', {
+            const vRes = await fetch(genEndpoint, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
                 photoBase64: target.photoBase64,
                 silent: true,
-                silentDuration: IDLE_DURATION,
+                silentDuration: wanModel === 'wan-2.5' ? 10 : (wanModel === 'wan-2.2' ? 10 : Math.min(IDLE_DURATION, 14)),
+                wanModel,
                 prompt: IDLE_PROMPT,
                 filename: idleFilename,
               }),
             })
             const vData = await vRes.json()
             if (!vData.success || !vData.predictionId) {
-              addLog(`[IDLE] ${target.label}: ERREUR creation - ${vData.error || 'unknown'}`)
+              addLog(`[IDLE] ${target.label}: ERREUR - ${vData.error || 'unknown'}`)
               continue
             }
 
@@ -533,9 +613,9 @@ export default function ScenarioBuilder() {
               return
             }
             addLog(`[IDLE] ${target.label}: ERREUR - ${pollResult.error || 'echec'}`)
+          } catch (err) {
+            addLog(`[IDLE] ${target.label}: ERREUR - ${err instanceof Error ? err.message : 'inconnue'}`)
           }
-        } catch (err) {
-          addLog(`[IDLE] ${target.label}: ERREUR - ${err instanceof Error ? err.message : 'inconnue'}`)
         }
       })
 
@@ -544,6 +624,112 @@ export default function ScenarioBuilder() {
       addLog(`[VIDEO] Decoupage audio pour ${usedCases.length} participants...`)
       setGenStatus({ phase: 'video', current: currentStep, total: totalSteps, detail: 'Phase 3: Decoupage audio...', log })
 
+      // ========== LIPSYNC PIPELINE (no cuts) ==========
+      if (useLipsync) {
+        addLog(`[VIDEO] Pipeline Lipsync: WAN 2.7 + lipsync-2-pro (pas de coupure)`)
+        const lipsyncResults: Record<string, string> = {}
+
+        const lipsyncPromises = usedCases.map(async (pid) => {
+          if (cancelledRef.current) return
+          const c = cases.find(cc => cc.id === pid)!
+          const audioB64 = combData.audioBase64?.[pid] || null
+          const fname = `meeting-${pid}-${Date.now()}.mp4`
+
+          addLog(`[VIDEO] ${c.label}: Generation lipsync en cours...`)
+          setGenStatus(prev => prev ? { ...prev, detail: `Phase 3: ${c.label} — WAN 2.7 + lipsync-2-pro...` } : null)
+
+          try {
+            const res = await fetch('/api/generate-video-lipsync', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                photoBase64: c.photoBase64,
+                audioBase64: audioB64,
+                filename: fname,
+                silent: false,
+              }),
+            })
+            const data = await res.json()
+            if (data.success && data.videoUrl) {
+              lipsyncResults[pid] = data.videoUrl
+              addLog(`[VIDEO] ${c.label}: OK — ${data.method}`)
+            } else {
+              addLog(`[VIDEO] ${c.label}: ERREUR - ${data.error || 'inconnue'}`)
+            }
+          } catch (err) {
+            addLog(`[VIDEO] ${c.label}: ERREUR - ${err instanceof Error ? err.message : 'inconnue'}`)
+          }
+        })
+
+        await Promise.all(lipsyncPromises)
+
+        // Build participant videos map
+        const participantVideos_: Record<string, string> = {}
+        for (const pid of usedCases) {
+          if (lipsyncResults[pid]) participantVideos_[pid] = lipsyncResults[pid]
+        }
+
+        if (Object.keys(participantVideos_).length === 0) {
+          addLog('[VIDEO] Aucune video generee')
+          setGenStatus({ phase: 'error', current: 0, total: 1, detail: 'Aucune video', log })
+          setIsGenerating(false)
+          return
+        }
+
+        setParticipantVideos(participantVideos_)
+        setMeetingTimeline(timeline)
+        setMeetingDuration(totalMeetingDuration)
+        setParticipantIdleVideos(idleResults)
+        setScenarioReady(true)
+        addLog(`[VIDEO] ${Object.keys(participantVideos_).length} videos lipsync generees`)
+
+        // Skip concat — each participant has ONE continuous video
+        // Go directly to saving meeting
+        setGenStatus({ phase: 'done', current: 4, total: 4, detail: 'Sauvegarde...', log })
+
+        // Build meeting data and save
+        const meetingParticipants = usedCases.map(pid => {
+          const c = cases.find(cc => cc.id === pid)!
+          return {
+            id: pid,
+            name: c.label,
+            role: 'speaker',
+            videoUrl: participantVideos_[pid] || '',
+            idleVideoUrl: idleResults[pid] || '',
+            color: ['#4A90D9', '#D94A4A', '#4AD97A', '#D9A84A', '#9B4AD9'][usedCases.indexOf(pid) % 5],
+          }
+        })
+
+        try {
+          const historyRes = await fetch('/api/meeting-history', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: `Réunion ${new Date().toLocaleDateString('fr-FR')} ${new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`,
+              cases: cases.filter(c => usedCases.includes(c.id)).map(c => ({ id: c.id, label: c.label, color: c.color, photoBase64: c.photoBase64, voiceId: c.voiceId, clonedVoiceId: c.clonedVoiceId || null })),
+              listeners: listeners.map(l => ({ id: l.id, label: l.label, color: l.color, photoBase64: l.photoBase64 })),
+              script: lines.map(l => ({ id: l.id, caseId: l.caseId, text: l.text, mode: l.mode })),
+              participants: meetingParticipants,
+              timeline,
+              duration: totalMeetingDuration,
+              participantVideos: participantVideos_,
+              participantIdleVideos: idleResults,
+            }),
+          })
+          const historyData = await historyRes.json()
+          if (historyData.id) {
+            addLog(`[SAVE] Meeting sauvegardee: ${historyData.id}`)
+          }
+        } catch (err) {
+          addLog(`[SAVE] Erreur sauvegarde: ${err instanceof Error ? err.message : 'inconnue'}`)
+        }
+
+        setGenStatus({ phase: 'done', current: 4, total: 4, detail: 'Termine!', log })
+        setIsGenerating(false)
+        return
+      }
+
+      // ========== LEGACY CHUNK PIPELINE (splits + concat) ==========
       type ChunkJob = {
         pid: string; label: string; chunkIndex: number; totalChunks: number;
         audioB64: string | null; audioPath: string; photoBase64: string | null;
@@ -594,17 +780,18 @@ export default function ScenarioBuilder() {
         }
       }
 
-      addLog(`[VIDEO] ${allJobs.length} videos a generer en parallele (${usedCases.length} participants)...`)
+      const totalJobs = allJobs.length
+      addLog(`[VIDEO] ${totalJobs} videos a generer en parallele...`)
 
-      // Step B: Fire ALL predictions in parallel + poll in parallel
+      // Step B: Generate ALL chunks in FULL PARALLEL (fast)
       let completedJobs = 0
       const jobResults: Record<string, { videoUrl: string; replicateUrl: string; chunkIndex: number }[]> = {}
       for (const pid of usedCases) jobResults[pid] = []
 
-      const generateOneChunk = async (job: ChunkJob): Promise<void> => {
+      const generateOneChunk = async (job: ChunkJob): Promise<{ videoUrl: string; replicateUrl: string } | null> => {
         const MAX_RETRIES = 3
         for (let retry = 0; retry < MAX_RETRIES; retry++) {
-          if (cancelledRef.current) return
+          if (cancelledRef.current) return null
           if (retry > 0) {
             const wait = retry * 15
             addLog(`[VIDEO] ${job.label}: chunk ${job.chunkIndex + 1} retry ${retry}/${MAX_RETRIES} dans ${wait}s...`)
@@ -612,7 +799,7 @@ export default function ScenarioBuilder() {
           }
 
           try {
-            const vRes = await fetch('/api/generate-video', {
+            const vRes = await fetch(genEndpoint, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({
@@ -621,39 +808,46 @@ export default function ScenarioBuilder() {
                 photoBase64: job.photoBase64,
                 prompt: job.prompt,
                 filename: job.filename,
+                wanModel,
               }),
             })
             const vData = await vRes.json()
             if (!vData.success || !vData.predictionId) {
               const errMsg = vData.error || 'unknown'
               addLog(`[VIDEO] ${job.label}: chunk ${job.chunkIndex + 1} ERREUR - ${errMsg}`)
-              if (errMsg.includes('temporarily') || errMsg.includes('503') || errMsg.includes('E004')) continue
-              return // fatal error — skip chunk
+              if (errMsg.includes('temporarily') || errMsg.includes('503') || errMsg.includes('E004') || errMsg.includes('E003') || errMsg.includes('unavailable') || errMsg.includes('high demand')) continue
+              return null
             }
 
             const pollResult = await pollPrediction(vData.predictionId, job.filename, (msg: string) => {
-              setGenStatus(prev => prev ? { ...prev, detail: `Phase 3: ${completedJobs}/${allJobs.length} OK — ${job.label} chunk ${job.chunkIndex + 1}: ${msg}` } : null)
+              setGenStatus(prev => prev ? { ...prev, detail: `Phase 3: ${completedJobs}/${totalJobs} OK — ${job.label} chunk ${job.chunkIndex + 1}: ${msg}` } : null)
             })
             if (pollResult.status === 'succeeded' && pollResult.videoUrl) {
-              jobResults[job.pid].push({ videoUrl: pollResult.videoUrl, replicateUrl: pollResult.replicateUrl || '', chunkIndex: job.chunkIndex })
               completedJobs++
-              addLog(`[VIDEO] ${job.label}: chunk ${job.chunkIndex + 1} OK (${completedJobs}/${allJobs.length})`)
-              setGenStatus(prev => prev ? { ...prev, detail: `Phase 3: ${completedJobs}/${allJobs.length} videos generees...` } : null)
-              return // success
+              addLog(`[VIDEO] ${job.label}: chunk ${job.chunkIndex + 1} OK (${completedJobs}/${totalJobs})`)
+              setGenStatus(prev => prev ? { ...prev, detail: `Phase 3: ${completedJobs}/${totalJobs} videos generees...` } : null)
+              return { videoUrl: pollResult.videoUrl, replicateUrl: pollResult.replicateUrl || '' }
             }
             const errMsg = pollResult.error || 'echec'
             addLog(`[VIDEO] ${job.label}: chunk ${job.chunkIndex + 1} ERREUR - ${errMsg}`)
-            if (errMsg.includes('temporarily') || errMsg.includes('503') || errMsg.includes('E004')) continue
-            return // fatal
+            if (errMsg.includes('temporarily') || errMsg.includes('503') || errMsg.includes('E004') || errMsg.includes('E003') || errMsg.includes('unavailable') || errMsg.includes('high demand')) continue
+            return null
           } catch (err) {
             addLog(`[VIDEO] ${job.label}: chunk ${job.chunkIndex + 1} ERREUR - ${err instanceof Error ? err.message : 'inconnue'}`)
           }
         }
+        return null
       }
 
-      // Launch ALL jobs in parallel
-      await Promise.all(allJobs.map(job => generateOneChunk(job)))
-      addLog(`[VIDEO] ${completedJobs}/${allJobs.length} chunks generes`)
+      // ALL chunks in parallel — maximum speed
+      const chunkPromises = allJobs.map(async (job) => {
+        const result = await generateOneChunk(job)
+        if (result) {
+          jobResults[job.pid].push({ ...result, chunkIndex: job.chunkIndex })
+        }
+      })
+      await Promise.all(chunkPromises)
+      addLog(`[VIDEO] ${completedJobs}/${totalJobs} chunks generes`)
 
       // Step C: Concat chunks per participant (parallel)
       const concatPromises = usedCases.map(async (pid) => {
@@ -727,6 +921,25 @@ export default function ScenarioBuilder() {
 
       setIsGenerating(false)
       setGenStatus({ phase: 'done', current: totalSteps, total: totalSteps, detail: `Pret ! ${totalGenerated} videos + ${Object.keys(idleResults).length} idle`, log })
+
+      // Auto-save to history
+      try {
+        await fetch('/api/meeting-history', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            cases: cases.map(c => ({ id: c.id, label: c.label, color: c.color, photoBase64: c.photoBase64, voiceId: c.voiceId, clonedVoiceId: c.clonedVoiceId })),
+            listeners: listeners.map(l => ({ id: l.id, label: l.label, color: l.color, photoBase64: l.photoBase64 })),
+            script: lines.map(l => ({ id: l.id, caseId: l.caseId, text: l.text, mode: l.mode })),
+            participantVideos: videoResults,
+            participantIdleVideos: idleResults,
+            timeline,
+            duration: totalMeetingDuration,
+          }),
+        })
+        loadHistory()
+        addLog(`[HISTORY] Reunion sauvegardee dans l'historique`)
+      } catch {}
     } catch (err) {
       // CRITICAL: Save whatever we have even on error
       if (Object.keys(videoResults).length > 0) {
@@ -741,6 +954,181 @@ export default function ScenarioBuilder() {
       setGenStatus({ phase: saved > 0 ? 'done' : 'error', current: currentStep, total: totalSteps, detail: saved > 0 ? `${saved} videos sauvees (erreur partielle)` : 'Erreur construction audio', log })
     }
   }, [cases, lines, listeners])
+
+  // Swap: re-generate only ONE participant's video, keep all others
+  const handleSwapCase = useCallback(async (caseId: string) => {
+    const c = cases.find(cc => cc.id === caseId)
+    if (!c) return
+    setSwapGenerating(true)
+    setSwapCaseId(null)
+    const log: string[] = []
+    const addLog = (msg: string) => { log.push(msg); setGenStatus({ phase: 'video', current: 0, total: 1, detail: msg, log }) }
+
+    try {
+      addLog(`[SWAP] Re-generation de ${c.label}...`)
+
+      // Step 1: Re-build TTS for this participant
+      const participantLines = lines.filter(l => l.caseId === caseId)
+      if (participantLines.length === 0) {
+        addLog(`[SWAP] Aucune replique pour ${c.label}`)
+        setSwapGenerating(false)
+        return
+      }
+
+      // Step 2: Generate TTS + combine audio for this participant
+      const ttsSegments: { participantId: string; pcmPath: string; duration: number; expressions: string[] }[] = []
+      for (const line of participantLines) {
+        if (line.mode === 'audio' && line.audioPcmPath) {
+          ttsSegments.push({ participantId: caseId, pcmPath: line.audioPcmPath, duration: line.audioDuration || 0, expressions: [] })
+          continue
+        }
+        const { cleanText, expressions } = parseExpressions(line.text)
+        if (!cleanText) continue
+        const voiceId = c.clonedVoiceId || c.voiceId
+        addLog(`[SWAP] TTS: ${cleanText.slice(0, 40)}...`)
+        const ttsRes = await fetch('/api/generate-tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: cleanText, voiceId }),
+        })
+        const ttsData = await ttsRes.json()
+        if (ttsData.success) {
+          ttsSegments.push({ participantId: caseId, pcmPath: ttsData.pcmPath, duration: ttsData.duration, expressions })
+        }
+      }
+
+      // Step 3: Combine audio for this participant
+      addLog(`[SWAP] Construction piste audio...`)
+      const timeline = meetingTimeline.filter(t => t.participantId === caseId)
+      const combRes = await fetch('/api/combine-audio', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ttsSegments: ttsSegments.map(s => ({ participantId: s.participantId, pcmPath: s.pcmPath, duration: s.duration })),
+          timeline,
+          totalDuration: meetingDuration,
+          participantIds: [caseId],
+        }),
+      })
+      const combData = await combRes.json()
+      if (!combData.success) {
+        addLog(`[SWAP] ERREUR combine audio: ${combData.error}`)
+        setSwapGenerating(false)
+        return
+      }
+
+      const audioTrack = combData.audioTracks[caseId]
+      const audioB64 = combData.audioBase64?.[caseId] || null
+
+      // Step 4: Split audio + generate video chunks sequentially
+      const MAX_CHUNK_SEC = wanModel === 'wan-2.5' ? 9 : 14 // WAN 2.5 max 10s video, WAN 2.7 max 15s
+      const VIDEO_PROMPT = (() => {
+        const BASE = 'A person in a professional video conference call, webcam framing head and shoulders, fixed camera. When audio plays, the person speaks with natural lip sync. When audio is silent, the person is actively listening: mouth fully closed, natural eye movements, subtle head tilts, slow blinks, gentle breathing, occasional nods. The person never stops moving naturally — continuous realistic human micro-movements throughout. Photorealistic quality, soft office lighting.'
+        const exprs = ttsSegments.flatMap(s => s.expressions).filter(Boolean)
+        if (exprs.length === 0) return BASE
+        return `${BASE} During speech, the person expresses these emotions/actions: ${Array.from(new Set(exprs)).join(', ')}.`
+      })()
+      const CONT_SUFFIX = ' CRITICAL: This is a continuation of the same video. The person MUST start in the EXACT same position, pose, head angle, and expression as shown in the reference image. No sudden movement, no position reset, no initial adjustment. Seamless continuation from the previous moment.'
+
+      let chunks: { wavPath: string; duration: number; audioBase64?: string }[] = []
+      if (meetingDuration > MAX_CHUNK_SEC) {
+        const splitRes = await fetch('/api/split-audio', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ wavPath: audioTrack, wavBase64: audioB64, maxChunkSeconds: MAX_CHUNK_SEC }),
+        })
+        const splitData = await splitRes.json()
+        if (splitData.success) chunks = splitData.chunks
+      }
+      if (chunks.length === 0) {
+        chunks = [{ wavPath: audioTrack, duration: meetingDuration, audioBase64: audioB64 || undefined }]
+      }
+
+      addLog(`[SWAP] ${chunks.length} chunks a generer sequentiellement...`)
+      const chunkResults: { videoUrl: string; replicateUrl: string }[] = []
+      let currentPhoto = c.photoBase64
+
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const chunk = chunks[ci]
+        const prompt = ci > 0 ? VIDEO_PROMPT + CONT_SUFFIX : VIDEO_PROMPT
+        const filename = `swap-${caseId}-${ci}-${Date.now()}.mp4`
+
+        addLog(`[SWAP] ${c.label} chunk ${ci + 1}/${chunks.length}...`)
+        const vRes = await fetch('/api/generate-video', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            audioBase64: chunk.audioBase64 || null,
+            audioPath: chunk.wavPath,
+            photoBase64: currentPhoto,
+            prompt,
+            filename,
+          }),
+        })
+        const vData = await vRes.json()
+        if (!vData.success || !vData.predictionId) {
+          addLog(`[SWAP] ERREUR chunk ${ci + 1}: ${vData.error || 'unknown'}`)
+          continue
+        }
+
+        const pollResult = await pollPrediction(vData.predictionId, filename, (msg: string) => {
+          addLog(`[SWAP] ${c.label} chunk ${ci + 1}: ${msg}`)
+        })
+        if (pollResult.status === 'succeeded' && pollResult.videoUrl) {
+          chunkResults.push({ videoUrl: pollResult.videoUrl, replicateUrl: pollResult.replicateUrl || '' })
+          addLog(`[SWAP] ${c.label} chunk ${ci + 1}/${chunks.length} OK`)
+
+          // Extract last frame for next chunk
+          if (ci < chunks.length - 1) {
+            try {
+              const frameRes = await fetch('/api/extract-frame', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ videoUrl: pollResult.videoUrl, remoteUrl: pollResult.replicateUrl }),
+              })
+              const frameData = await frameRes.json()
+              if (frameData.success && frameData.frameBase64) {
+                currentPhoto = frameData.frameBase64
+              }
+            } catch {}
+          }
+        }
+      }
+
+      // Step 5: Concat if multiple chunks
+      let finalVideoUrl = ''
+      if (chunkResults.length > 1) {
+        const concatRes = await fetch('/api/concat-videos', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            videoPaths: chunkResults.map(r => r.videoUrl),
+            remoteUrls: chunkResults.map(r => r.replicateUrl),
+            outputFilename: `swap-${caseId}-${Date.now()}.mp4`,
+          }),
+        })
+        const concatData = await concatRes.json()
+        finalVideoUrl = concatData.success ? concatData.videoUrl : chunkResults[0]?.videoUrl || ''
+      } else {
+        finalVideoUrl = chunkResults[0]?.videoUrl || ''
+      }
+
+      if (finalVideoUrl) {
+        setParticipantVideos(prev => ({ ...prev, [caseId]: finalVideoUrl }))
+        addLog(`[SWAP] ${c.label} re-generee avec succes !`)
+        setGenStatus({ phase: 'done', current: 1, total: 1, detail: `${c.label} swappee !`, log })
+        // Auto-save updated meeting
+        saveToHistory()
+      } else {
+        addLog(`[SWAP] ERREUR: aucun chunk reussi`)
+        setGenStatus({ phase: 'error', current: 0, total: 1, detail: 'Swap echoue', log })
+      }
+    } catch (err) {
+      addLog(`[SWAP] ERREUR: ${err instanceof Error ? err.message : 'inconnue'}`)
+      setGenStatus({ phase: 'error', current: 0, total: 1, detail: 'Swap echoue', log })
+    }
+    setSwapGenerating(false)
+  }, [cases, lines, meetingTimeline, meetingDuration, participantVideos, pollPrediction, saveToHistory])
 
   // Launch — create meeting room with continuous videos + timeline
   const launchInMeeting = async () => {
@@ -823,9 +1211,53 @@ export default function ScenarioBuilder() {
         <h1 style={{ fontSize: 17, fontWeight: 700 }}>Scenario Builder</h1>
         <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
           {launched && <span style={{ fontSize: 11, color: '#4ade80', fontWeight: 600 }}>● Reunion en cours</span>}
+          <select
+            value={wanModel}
+            onChange={e => setWanModel(e.target.value as 'wan-2.5' | 'wan-2.7' | 'wan-2.6' | 'wan-2.2')}
+            style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid #444', background: '#1a1a1a', color: wanModel === 'wan-2.5' ? '#4ade80' : '#f59e0b', fontSize: 10, fontWeight: 700, cursor: 'pointer' }}
+          >
+            <option value="wan-2.5">WAN 2.5 (recommande - lip-sync)</option>
+            <option value="wan-2.7">WAN 2.7</option>
+            <option value="wan-2.6">WAN 2.6</option>
+            <option value="wan-2.2">WAN 2.2 (ancien)</option>
+          </select>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer', fontSize: 10, fontWeight: 700, color: useLipsync ? '#4ade80' : '#888' }}>
+            <input type="checkbox" checked={useLipsync} onChange={e => setUseLipsync(e.target.checked)} style={{ accentColor: '#4ade80' }} />
+            Lipsync Pro (pas de coupure)
+          </label>
+          <button onClick={() => { setShowHistory(!showHistory); if (!showHistory) loadHistory() }} style={{ padding: '4px 12px', borderRadius: 6, border: '1px solid #444', background: showHistory ? '#2a2a4a' : 'none', color: '#a5b4fc', fontSize: 11, cursor: 'pointer', fontWeight: 600 }}>
+            Historique ({historyList.length})
+          </button>
           <a href="/" style={{ color: '#818cf8', fontSize: 12, textDecoration: 'none' }}>Aller a la reunion</a>
         </div>
       </div>
+
+      {/* History panel */}
+      {showHistory && (
+        <div style={{ background: '#151525', borderBottom: '1px solid #333', padding: '12px 20px', maxHeight: 250, overflowY: 'auto' }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: '#a5b4fc', marginBottom: 8 }}>Historique des reunions</div>
+          {historyList.length === 0 ? (
+            <div style={{ color: '#555', fontSize: 11 }}>Aucune reunion sauvegardee</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {historyList.map(h => (
+                <div key={h.id} style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#1a1a2e', borderRadius: 8, padding: '8px 12px' }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: '#e0e7ff' }}>{h.name}</div>
+                    <div style={{ fontSize: 10, color: '#666' }}>{h.casesCount} participants · {h.duration.toFixed(0)}s · {new Date(h.createdAt).toLocaleString('fr-FR')}</div>
+                  </div>
+                  <button onClick={() => loadFromHistory(h.id)} style={{ padding: '4px 10px', borderRadius: 6, border: 'none', background: '#6366f1', color: 'white', fontSize: 10, fontWeight: 700, cursor: 'pointer' }}>
+                    Charger
+                  </button>
+                  <button onClick={async () => { await fetch('/api/meeting-history', { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: h.id }) }); loadHistory() }} style={{ padding: '4px 8px', borderRadius: 6, border: 'none', background: '#333', color: '#f87171', fontSize: 10, cursor: 'pointer' }}>
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
 
       <div style={{ display: 'flex', height: 'calc(100vh - 45px)' }}>
         {/* Left: Cases config */}
@@ -907,6 +1339,45 @@ export default function ScenarioBuilder() {
                     >
                       {Object.entries(voices).map(([id, v]) => <option key={id} value={id}>{v.label}</option>)}
                     </select>
+                  </div>
+                )}
+
+                {/* Swap / Re-generate this case only */}
+                {scenarioReady && participantVideos[c.id] && !isGenerating && (
+                  <div style={{ marginTop: 8, borderTop: '1px solid #2a2a2a', paddingTop: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <div style={{ width: 6, height: 6, borderRadius: '50%', background: '#4ade80' }} />
+                      <span style={{ fontSize: 9, color: '#4ade80', fontWeight: 600 }}>Video generee</span>
+                    </div>
+                    <button
+                      onClick={() => setSwapCaseId(swapCaseId === c.id ? null : c.id)}
+                      disabled={swapGenerating}
+                      style={{
+                        marginTop: 4, width: '100%', padding: '6px', borderRadius: 4,
+                        border: swapCaseId === c.id ? '1px solid #f59e0b' : '1px solid #444',
+                        background: swapCaseId === c.id ? '#1a1a0a' : 'none',
+                        color: swapCaseId === c.id ? '#f59e0b' : '#888', fontSize: 9, cursor: 'pointer', fontWeight: 600,
+                      }}
+                    >
+                      {swapCaseId === c.id ? '↩ Annuler swap' : '🔄 Changer cette case'}
+                    </button>
+                    {swapCaseId === c.id && (
+                      <div style={{ marginTop: 6, fontSize: 9, color: '#f59e0b', lineHeight: 1.4 }}>
+                        Modifie la photo, voix ou texte de cette case puis clique ci-dessous.
+                        Seule cette case sera re-generee — les autres videos restent.
+                        <button
+                          onClick={() => handleSwapCase(c.id)}
+                          disabled={swapGenerating}
+                          style={{
+                            marginTop: 6, width: '100%', padding: '8px', borderRadius: 6,
+                            border: 'none', fontSize: 11, fontWeight: 700, cursor: swapGenerating ? 'wait' : 'pointer',
+                            background: swapGenerating ? '#333' : 'linear-gradient(135deg, #f59e0b, #d97706)', color: 'white',
+                          }}
+                        >
+                          {swapGenerating ? 'Re-generation en cours...' : 'Re-generer cette case'}
+                        </button>
+                      </div>
+                    )}
                   </div>
                 )}
               </div>
